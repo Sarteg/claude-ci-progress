@@ -1,0 +1,20 @@
+{
+  "name": "ci-progress",
+  "version": "0.6.0",
+  "description": "A CI progress tab: one progress bar per GitHub Actions runner.",
+  "author": {
+    "name": "Sarteg"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "folders": {
+      "type": "string",
+      "title": "Repo folders",
+      "description": "Optional. Comma-separated full paths of git repos to watch. Empty means: the session folder, or the repos found below it.",
+      "default": ""
+    }
+  },
+  "homepage": "https://github.com/Sarteg/claude-ci-progress",
+  "repository": "https://github.com/Sarteg/claude-ci-progress",
+  "license": "MIT"
+}

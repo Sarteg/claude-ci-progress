@@ -1,0 +1,5 @@
+{
+  "name": "ci-progress",
+  "owner": { "name": "Sarteg" },
+  "plugins": [{ "name": "ci-progress", "source": "./" }]
+}
