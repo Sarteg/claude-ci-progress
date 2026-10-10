@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="ci-progress logo" width="128" height="128">
+</p>
+
 # claude-ci-progress
 
 A [Claude Code](https://claude.com/claude-code) mod that adds a live **CI progress** tab for GitHub Actions. It shows one progress bar for each runner, so you can watch your CI without leaving the terminal.
