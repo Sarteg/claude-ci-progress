@@ -2,6 +2,17 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Job, Lane } from '../types'
+import {
+  buildArgs,
+  parseGhResponse,
+  parseJson as parse,
+  pauseMessage,
+  pauseUntil,
+  remember,
+  runsEndpoint,
+  runsFrom,
+} from './gh'
+import type { CacheEntry } from './gh'
 
 const PANE = 'ci-progress'
 const lanes = atom({ plugin: 'ci-progress', key: 'lanes' } as const, [])
@@ -12,6 +23,8 @@ const pulse = atom({ plugin: 'ci-progress', key: 'pulse' } as const, false)
 const BUSY_EVERY = 10_000
 const IDLE_EVERY = 30_000
 const RESCAN_EVERY = 60_000
+// A poll forced by the end of a Claude turn still waits at least this long after the last one.
+const MIN_GAP = 5_000
 const MAX_REPOS = 6
 
 export const bar = (part: number, width: number) => {
@@ -89,14 +102,6 @@ export const repoDirsFrom = (findOut: string) => {
   return [...new Set(dirs)].sort().slice(0, MAX_REPOS)
 }
 
-const parse = (text: string): unknown => {
-  try {
-    return JSON.parse(text)
-  } catch {
-    return null
-  }
-}
-
 type ApiJob = {
   name: string
   status: string
@@ -121,6 +126,53 @@ let hasRunning = false
 let lastPoll = 0
 let polls = 0
 let note = 'not polled yet'
+let forceNext = false
+// The rate limit belongs to the token, so one pause covers every repo.
+let pausedUntil = 0
+const etags = new Map<string, CacheEntry>()
+// Repos where listing runners is not allowed (needs admin rights): do not ask again.
+const noRunnerAccess = new Set<string>()
+
+type ApiResult = { ok: true; body: string } | { ok: false; error: string; status: number; limited: boolean }
+
+// One GitHub API call. It sends the saved ETag, so an unchanged page comes back as `304 Not Modified`,
+// which does not count against the hourly rate limit. It also reads the rate-limit headers and
+// sets `pausedUntil` when the limit is hit or nearly used up.
+const api = async ($: EngineInterface, dir: string, endpoint: string): Promise<ApiResult> => {
+  const key = `${dir}\n${endpoint}`
+  const hit = etags.get(key)
+  const r = await $.process.run(buildArgs(endpoint, hit?.etag), { cwd: dir, timeoutMs: 20_000 })
+  const res = parseGhResponse(r.stdout)
+  const until = pauseUntil(res, r.stderr, await $.clock.now())
+
+  if (until !== null) {
+    pausedUntil = Math.max(pausedUntil, until)
+  }
+
+  // Some `gh` versions exit non-zero on a 304, so go by the status line and not the exit code.
+  if (res?.status === 304 && hit) {
+    remember(etags, key, hit)
+
+    return { ok: true, body: hit.body }
+  }
+
+  if (res !== null && res.status >= 200 && res.status < 300) {
+    if (res.headers.etag) {
+      remember(etags, key, { etag: res.headers.etag, body: res.body })
+    }
+
+    return { ok: true, body: res.body }
+  }
+
+  const message = (parse(res?.body ?? '') as { message?: string } | null)?.message
+
+  return {
+    ok: false,
+    error: message ?? (r.stderr.trim().split('\n')[0] || 'gh failed'),
+    status: res?.status ?? 0,
+    limited: until !== null,
+  }
+}
 
 const resolveRepos = async ($: EngineInterface, now: number) => {
   if (folders.length > 0) {
@@ -175,59 +227,42 @@ const collect = async (
 ): Promise<{ lanes: Lane[]; failed: string | null; listed: number; active: number }> => {
   // Ask for each active status, not the newest N runs: one push can start 30+ runs, which pushed
   // long-running jobs off a `--limit 20` list and showed busy runners as idle.
-  const lists = await Promise.all(
-    ACTIVE_STATUSES.map(s =>
-      $.process.run(
-        ['gh', 'run', 'list', '--status', s, '--limit', '100', '--json', 'databaseId,workflowName,headBranch,status'],
-        { cwd: dir, timeoutMs: 20_000 },
-      ),
-    ),
-  )
-  const bad = lists.find(l => l.exitCode !== 0)
+  // Each call is conditional (see `api`), so a list that has not changed costs nothing.
+  const lists = await Promise.all(ACTIVE_STATUSES.map(s => api($, dir, runsEndpoint(s))))
+  const bad = lists.find(l => !l.ok)
 
-  if (bad) {
+  if (bad && !bad.ok) {
     return {
       lanes: [],
-      failed: `${dir}: ${bad.stderr.trim().split('\n')[0] || 'gh failed'}`,
+      failed: `${dir}: ${bad.error}`,
       listed: 0,
       active: 0,
     }
   }
 
-  const rows = uniqueRuns(
-    lists.map(
-      l =>
-        (parse(l.stdout) ?? []) as Array<{
-          databaseId: number
-          workflowName: string
-          headBranch: string
-          status: string
-        }>,
-    ),
-  )
+  const rows = uniqueRuns(lists.map(l => (l.ok ? runsFrom(l.body) : [])))
   const active = rows.filter(r => r.status !== 'completed')
   const found: Record<string, Lane> = {}
 
-  const runners = await $.process.run(
-    ['gh', 'api', 'repos/{owner}/{repo}/actions/runners?per_page=100'],
-    { cwd: dir, timeoutMs: 20_000 },
-  )
+  const runners = noRunnerAccess.has(dir)
+    ? null
+    : await api($, dir, 'repos/{owner}/{repo}/actions/runners?per_page=100')
 
-  if (runners.exitCode === 0) {
-    const all = (parse(runners.stdout) as { runners?: ApiRunner[] } | null)?.runners ?? []
+  if (runners?.ok) {
+    const all = (parse(runners.body) as { runners?: ApiRunner[] } | null)?.runners ?? []
 
     for (const r of all) {
       found[r.name] = { key: r.name, online: r.status === 'online', jobs: [] }
     }
+  } else if (runners && !runners.limited && (runners.status === 403 || runners.status === 404)) {
+    // No admin rights (or GitHub-hosted runners only): the bars and the queue still work without it.
+    noRunnerAccess.add(dir)
   }
 
   const perRun = await Promise.all(
     active.map(async r => {
-      const res = await $.process.run(
-        ['gh', 'api', `repos/{owner}/{repo}/actions/runs/${r.databaseId}/jobs?per_page=100`],
-        { cwd: dir, timeoutMs: 20_000 },
-      )
-      const jobs = (parse(res.stdout) as { jobs?: ApiJob[] } | null)?.jobs ?? []
+      const res = await api($, dir, `repos/{owner}/{repo}/actions/runs/${r.databaseId}/jobs?per_page=100`)
+      const jobs = (res.ok ? (parse(res.body) as { jobs?: ApiJob[] } | null)?.jobs : undefined) ?? []
 
       return jobs.map(j => {
         const steps = j.steps ?? []
@@ -261,13 +296,24 @@ const collect = async (
 
 const poll = async ($: EngineInterface) => {
   const now = await $.clock.now()
-  const wait = isBusy ? BUSY_EVERY : IDLE_EVERY
+  const wait = forceNext ? MIN_GAP : isBusy ? BUSY_EVERY : IDLE_EVERY
 
   if (now - lastPoll < wait - 500) {
     return
   }
 
+  forceNext = false
   lastPoll = now
+
+  // Rate-limited: make no GitHub calls until the limit resets.
+  if (now < pausedUntil) {
+    note = `paused until ${new Date(pausedUntil).toISOString()}`
+    await update($, error, () => pauseMessage(pausedUntil))
+    await update($, lanes, () => [])
+
+    return
+  }
+
   polls += 1
 
   await resolveRepos($, now)
@@ -312,7 +358,7 @@ const poll = async ($: EngineInterface) => {
   note = `repos: ${repoDirs.join(', ')}; ${results.reduce((n, r) => n + r.active, 0)} active runs; ${failed.length} failed`
 
   if (failed.length === results.length) {
-    await update($, error, () => failed[0]?.failed ?? 'gh failed')
+    await update($, error, () => (pausedUntil > now ? pauseMessage(pausedUntil) : (failed[0]?.failed ?? 'gh failed')))
     await update($, lanes, () => [])
 
     return
@@ -367,7 +413,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    lastPoll = 0
+    // Refresh soon after a turn, but not more than once every MIN_GAP: agent teams end turns often.
+    forceNext = true
     void poll($).catch(() => {})
 
     return next(e)
