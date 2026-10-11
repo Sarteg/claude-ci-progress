@@ -22,6 +22,14 @@ export const bar = (part: number, width: number) => {
 
 export const QUEUE = 'queued'
 
+// Every run status that is not finished (`gh run list --status` takes one value per call).
+export const ACTIVE_STATUSES = ['in_progress', 'queued', 'waiting', 'pending', 'requested'] as const
+
+// One row per run id: the same run can come back from two status calls if it changes state between them.
+export const uniqueRuns = <T extends { databaseId: number }>(lists: T[][]): T[] => [
+  ...new Map(lists.flat().map(r => [r.databaseId, r] as const)).values(),
+]
+
 export const laneOf = (status: string, runnerName: string | null) =>
   status === 'queued' || !runnerName ? QUEUE : runnerName
 
@@ -165,26 +173,38 @@ const collect = async (
   dir: string,
   label: string | null,
 ): Promise<{ lanes: Lane[]; failed: string | null; listed: number; active: number }> => {
-  const list = await $.process.run(
-    ['gh', 'run', 'list', '--limit', '20', '--json', 'databaseId,workflowName,headBranch,status'],
-    { cwd: dir, timeoutMs: 20_000 },
+  // Ask for each active status, not the newest N runs: one push can start 30+ runs, which pushed
+  // long-running jobs off a `--limit 20` list and showed busy runners as idle.
+  const lists = await Promise.all(
+    ACTIVE_STATUSES.map(s =>
+      $.process.run(
+        ['gh', 'run', 'list', '--status', s, '--limit', '100', '--json', 'databaseId,workflowName,headBranch,status'],
+        { cwd: dir, timeoutMs: 20_000 },
+      ),
+    ),
   )
+  const bad = lists.find(l => l.exitCode !== 0)
 
-  if (list.exitCode !== 0) {
+  if (bad) {
     return {
       lanes: [],
-      failed: `${dir}: ${list.stderr.trim().split('\n')[0] || 'gh failed'}`,
+      failed: `${dir}: ${bad.stderr.trim().split('\n')[0] || 'gh failed'}`,
       listed: 0,
       active: 0,
     }
   }
 
-  const rows = (parse(list.stdout) ?? []) as Array<{
-    databaseId: number
-    workflowName: string
-    headBranch: string
-    status: string
-  }>
+  const rows = uniqueRuns(
+    lists.map(
+      l =>
+        (parse(l.stdout) ?? []) as Array<{
+          databaseId: number
+          workflowName: string
+          headBranch: string
+          status: string
+        }>,
+    ),
+  )
   const active = rows.filter(r => r.status !== 'completed')
   const found: Record<string, Lane> = {}
 

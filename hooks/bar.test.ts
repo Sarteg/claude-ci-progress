@@ -1,6 +1,31 @@
 import { test, expect } from 'claude-code/testing'
 
-import { bar, clip, dotState, laneOf, laneProgress, laneSteps, repoDirsFrom, summarize } from './register'
+import {
+  ACTIVE_STATUSES,
+  bar,
+  clip,
+  dotState,
+  laneOf,
+  laneProgress,
+  laneSteps,
+  repoDirsFrom,
+  summarize,
+  uniqueRuns,
+} from './register'
+
+test('active runs are listed by status, so old busy runs are not cut off', () => {
+  expect(ACTIVE_STATUSES).toContain('in_progress')
+  expect(ACTIVE_STATUSES).toContain('queued')
+  expect(ACTIVE_STATUSES).not.toContain('completed')
+})
+
+test('a run seen by two status calls counts once', () => {
+  const a = { databaseId: 1, status: 'queued' }
+  const b = { databaseId: 2, status: 'in_progress' }
+  const a2 = { databaseId: 1, status: 'in_progress' }
+  expect(uniqueRuns([[a, b], [a2]]).map(r => r.databaseId)).toEqual([1, 2])
+  expect(uniqueRuns([[a, b], [a2]])[0].status).toBe('in_progress')
+})
 
 test('bar fills in proportion', () => {
   expect(bar(0, 10)).toBe('░'.repeat(10))

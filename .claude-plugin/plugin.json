@@ -1,6 +1,6 @@
 {
   "name": "ci-progress",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A CI progress tab: one progress bar per GitHub Actions runner.",
   "author": {
     "name": "Sarteg"
